@@ -19,8 +19,8 @@ import (
 
 // input parameters
 var (
-	departureDateStr       = "2022-09-10" // primer día para la ida
-	returnDateStr          = "2022-09-20" // primer día para la vuelta
+	departureDateStr       = "2025-05-10" // primer día para la ida
+	returnDateStr          = "2025-05-20" // primer día para la vuelta
 	originAirportCode      = "EZE"        // aeropuerto de origen
 	destinationAirportCode = "PUJ"        // aeropuerto de destino
 	daysToQuery            = 1            // días corridos para buscar ida y vuelta
@@ -34,6 +34,8 @@ const (
 
 	dateLayout        = "2006-01-02"
 	bigMaxMilesNumber = 9_999_999
+	flightSearchApi   = "api-air-flightsearch-green.smiles.com.br"
+	boardingTaxApi    = "api-airlines-boarding-tax-green.smiles.com.br"
 )
 
 func main() {
@@ -126,7 +128,7 @@ func makeRequest(wg *sync.WaitGroup, ch chan<- model.Result, c *http.Client, sta
 	data := model.Data{}
 
 	u := createURL(startingDate.Format(dateLayout), originAirport, destinationAirport) // Encode and assign back to the original query.
-	req := createRequest(u, "api-air-flightsearch-prd.smiles.com.br")
+	req := createRequest(u, flightSearchApi)
 
 	//fmt.Println("Making request with URL: ", req.URL.String())
 	//fmt.Printf("Consultando %s - %s para el día %s \n", originAirport, destinationAirport, startingDate.Format(dateLayout))
@@ -170,13 +172,14 @@ func createRequest(u url.URL, authority string) *http.Request {
 	req.Header.Add("referer", "https://www.smiles.com.ar")
 	req.Header.Add("channel", "web")
 	req.Header.Add("authority", authority)
+	req.Header.Add("user-agent", "Mozilla/5.0")
 	return req
 }
 
 func createURL(departureDate string, originAirport string, destinationAirport string) url.URL {
 	u := url.URL{
 		Scheme:   "https",
-		Host:     "api-air-flightsearch-prd.smiles.com.br",
+		Host:     flightSearchApi,
 		RawQuery: "adults=1&cabinType=all&children=0&currencyCode=ARS&infants=0&isFlexibleDateChecked=false&tripType=2&forceCongener=true&r=ar",
 		Path:     "/v1/airlines/search",
 	}
@@ -191,7 +194,7 @@ func createURL(departureDate string, originAirport string, destinationAirport st
 func createTaxURL(departureFlight *model.Flight, departureFare *model.Fare) url.URL {
 	u := url.URL{
 		Scheme:   "https",
-		Host:     "api-airlines-boarding-tax-prd.smiles.com.br",
+		Host:     boardingTaxApi,
 		RawQuery: "adults=1&children=0&infants=0&highlightText=SMILES_CLUB",
 		Path:     "/v1/airlines/flight/boardingtax",
 	}
@@ -316,7 +319,7 @@ func processResults(c *http.Client, r []model.Result) {
 
 func getTaxForFlight(c *http.Client, flight *model.Flight, fare *model.Fare) *model.BoardingTax {
 	u := createTaxURL(flight, fare)
-	r := createRequest(u, "api-airlines-boarding-tax-prd.smiles.com.br")
+	r := createRequest(u, boardingTaxApi)
 	var body []byte
 	var data model.BoardingTax
 
