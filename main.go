@@ -11,10 +11,11 @@ import (
 	"smiles/model"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
-	"github.com/schollz/progressbar/v3"
+	tele "gopkg.in/telebot.v3"
 )
 
 // input parameters
@@ -39,78 +40,96 @@ const (
 )
 
 func main() {
+	client := http.Client{}
 
-	if useCommandLineArguments {
-		if len(os.Args) != 6 {
-			fmt.Println("Forma de Uso: Origen Destino Fecha Ida Fecha Vuelta Cantidad de días a consultar")
-			fmt.Println("Ejemplo: smiles BUE PUJ 2023-01-10 2023-01-20 5")
-			os.Exit(1)
+	pref := tele.Settings{
+		Token:  os.Getenv("TOKEN"),
+		Poller: &tele.LongPoller{Timeout: 10 * time.Second},
+	}
+
+	b, err := tele.NewBot(pref)
+	if err != nil {
+		log.Fatal(err)
+		return
+	}
+
+	b.Handle("/search", func(c tele.Context) error {
+		args := c.Args()
+		paramsErr := validateParameters(args)
+
+		if len(paramsErr) != 0 {
+			return c.Send(err)
 		}
 
-		validateParameters()
-	}
+		startingDepartureDate, err := time.Parse(dateLayout, departureDateStr)
+		startingReturningDate, err := time.Parse(dateLayout, returnDateStr)
 
-	c := http.Client{}
+		_ = startingDepartureDate
+		_ = startingReturningDate
 
-	startingDepartureDate, err := time.Parse(dateLayout, departureDateStr)
-	startingReturningDate, err := time.Parse(dateLayout, returnDateStr)
-	if err != nil {
-		log.Fatal("Error parsing starting date")
-	}
+		if err != nil {
+			return c.Send("Error parsing dates")
+		}
 
-	fmt.Printf("Primer día de búsqueda para la ida: %s\n", departureDateStr)
-	fmt.Printf("Primer día de búsqueda para la vuelta: %s\n", returnDateStr)
-	fmt.Printf("Desde: %s\n", originAirportCode)
-	fmt.Printf("Hasta: %s\n", destinationAirportCode)
+		c.Send("<i>Buscando... <b>"+originAirportCode+" - "+destinationAirportCode+"</b></i>", &tele.SendOptions{
+			ParseMode: "HTML",
+		})
 
-	departuresCh := make(chan model.Result, daysToQuery)
-	returnsCh := make(chan model.Result, daysToQuery)
+		departuresCh := make(chan model.Result, daysToQuery)
+		returnsCh := make(chan model.Result, daysToQuery)
 
-	bar := progressbar.NewOptions(daysToQuery*2,
-		progressbar.OptionSetDescription("Consultando vuelos en las fechas y tramos seleccionados.."),
-		progressbar.OptionSetWidth(40),
-		progressbar.OptionSetRenderBlankState(true),
-	)
+		var wg sync.WaitGroup
 
-	start := time.Now()
-	var wg sync.WaitGroup
+		for i := 0; i < daysToQuery; i++ {
+			departureDate := startingDepartureDate.AddDate(0, 0, i)
+			returnDate := startingReturningDate.AddDate(0, 0, i)
 
-	for i := 0; i < daysToQuery; i++ {
-		departureDate := startingDepartureDate.AddDate(0, 0, i)
-		returnDate := startingReturningDate.AddDate(0, 0, i)
+			wg.Add(2)
+			go makeRequest(&wg, departuresCh, &client, departureDate, originAirportCode, destinationAirportCode)
+			// inverting airports and changing date to query returns
+			go makeRequest(&wg, returnsCh, &client, returnDate, destinationAirportCode, originAirportCode)
+		}
 
-		wg.Add(2)
-		go makeRequest(&wg, departuresCh, &c, departureDate, originAirportCode, destinationAirportCode, bar)
-		// inverting airports and changing date to query returns
-		go makeRequest(&wg, returnsCh, &c, returnDate, destinationAirportCode, originAirportCode, bar)
-	}
+		wg.Wait()
+		close(departuresCh)
+		close(returnsCh)
 
-	wg.Wait()
-	close(departuresCh)
-	close(returnsCh)
+		var departureResults []model.Result
+		var returnResults []model.Result
 
-	elapsed := time.Since(start).Round(time.Second).String()
-	fmt.Printf("\nLas consultas tomaron %s\n", elapsed)
+		for elem := range departuresCh {
+			departureResults = append(departureResults, elem)
+		}
 
-	var departureResults []model.Result
-	var returnResults []model.Result
+		for elem := range returnsCh {
+			returnResults = append(returnResults, elem)
+		}
 
-	for elem := range departuresCh {
-		departureResults = append(departureResults, elem)
-	}
+		sortResults(departureResults)
+		sortResults(returnResults)
 
-	for elem := range returnsCh {
-		returnResults = append(returnResults, elem)
-	}
+		c.Send("<b>VUELOS DE IDA</b>", &tele.SendOptions{
+			ParseMode: "HTML",
+		})
 
-	sortResults(departureResults)
-	sortResults(returnResults)
+		departureResultsHtml := processResults(&client, departureResults)
+		c.Send(departureResultsHtml, &tele.SendOptions{
+			ParseMode: "HTML",
+		})
 
-	fmt.Println("VUELOS DE IDA")
-	processResults(&c, departureResults)
+		c.Send("<b>VUELOS DE VUELTA</b>", &tele.SendOptions{
+			ParseMode: "HTML",
+		})
 
-	fmt.Println("VUELOS DE VUELTA")
-	processResults(&c, returnResults)
+		returnResultsHtml := processResults(&client, returnResults)
+		c.Send(returnResultsHtml, &tele.SendOptions{
+			ParseMode: "HTML",
+		})
+
+		return nil
+	})
+
+	b.Start()
 }
 
 func sortResults(r []model.Result) {
@@ -119,9 +138,8 @@ func sortResults(r []model.Result) {
 	})
 }
 
-func makeRequest(wg *sync.WaitGroup, ch chan<- model.Result, c *http.Client, startingDate time.Time, originAirport string, destinationAirport string, bar *progressbar.ProgressBar) {
+func makeRequest(wg *sync.WaitGroup, ch chan<- model.Result, c *http.Client, startingDate time.Time, originAirport string, destinationAirport string) {
 	defer wg.Done()
-	defer bar.Add(1)
 
 	var body []byte
 	var err error
@@ -217,47 +235,45 @@ func getSmilesClubFare(f *model.Flight) *model.Fare {
 	return &model.Fare{Miles: bigMaxMilesNumber}
 }
 
-func validateParameters() {
-	originAirportCode = os.Args[1]
+func validateParameters(a []string) string {
+	originAirportCode = a[0]
 	if len(originAirportCode) != 3 {
-		fmt.Fprintf(os.Stderr, "Error: El aeropuerto de origen %s no es válido\n", originAirportCode)
-		os.Exit(1)
+		return "Error: El aeropuerto de origen " + originAirportCode + " no es válido"
 	}
 
-	destinationAirportCode = os.Args[2]
+	destinationAirportCode = a[1]
 	if len(destinationAirportCode) != 3 {
-		fmt.Fprintf(os.Stderr, "Error: El aeropuerto de destino %s no es válido\n", destinationAirportCode)
-		os.Exit(1)
+		return "Error: El aeropuerto de destino " + destinationAirportCode + " no es válido"
 	}
 
-	departureDateStr = os.Args[3]
+	departureDateStr = a[2]
 	_, err := time.Parse(dateLayout, departureDateStr)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: La fecha de salida %s no es válida. %v \n", departureDateStr, err)
-		os.Exit(1)
+		return "Error: La fecha de salida " + departureDateStr + " no es válida"
 	}
 
-	returnDateStr = os.Args[4]
+	returnDateStr = a[3]
 	_, err = time.Parse(dateLayout, returnDateStr)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: La fecha de regreso %s no es válida. %v \n", returnDateStr, err)
-		os.Exit(1)
+		return "Error: La fecha de regreso " + returnDateStr + " no es válida"
 	}
 
-	v, err := strconv.ParseInt(os.Args[5], 10, 64)
+	v, err := strconv.ParseInt(a[4], 10, 64)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: La cantidad de días %d no es válida. %v \n", v, err)
-		os.Exit(1)
+		return "Error: La cantidad de días " + string(v) + " no es válida"
 	}
 
 	if v > 10 {
-		fmt.Fprintf(os.Stderr, "Error: La cantidad de días no puede ser mayor a 10 \n")
-		os.Exit(1)
+		return "Error: La cantidad de días no puede ser mayor a 10;"
 	}
 	daysToQuery = int(v)
+
+	return ""
 }
 
-func processResults(c *http.Client, r []model.Result) {
+func processResults(c *http.Client, r []model.Result) string {
+	var sb strings.Builder
+
 	// using the first flight as cheapest default
 	var cheapestFlight *model.Flight
 	cheapestFare := &model.Fare{
@@ -286,35 +302,17 @@ func processResults(c *http.Client, r []model.Result) {
 		}
 
 		if cheapestFareDay.Miles != bigMaxMilesNumber {
-			fmt.Printf("Vuelo más barato del día %s: %s - %s, %s, %s, %d escalas, %d millas\n",
-				cheapestFlightDay.Departure.Date.Format(dateLayout),
-				cheapestFlightDay.Departure.Airport.Code,
-				cheapestFlightDay.Arrival.Airport.Code,
-				cheapestFlightDay.Cabin,
-				cheapestFlightDay.Airline.Name,
-				cheapestFlightDay.Stops,
-				cheapestFareDay.Miles,
-			)
+			sb.WriteString("<b>●</b> " + cheapestFlightDay.Departure.Date.Format(dateLayout) + ": " + cheapestFlightDay.Departure.Airport.Code + " - " + cheapestFlightDay.Arrival.Airport.Code + ", " + cheapestFlightDay.Cabin + ", " + cheapestFlightDay.Airline.Name + ", " + strconv.Itoa(cheapestFlightDay.Stops) + " escalas, " + strconv.Itoa(cheapestFareDay.Miles) + " millas \n")
 		}
 	}
 
-	fmt.Println()
 	if cheapestFare.Miles != bigMaxMilesNumber {
 		boardingTax := getTaxForFlight(c, cheapestFlight, cheapestFare)
 
-		fmt.Printf("Vuelo más barato en estas fechas: %s, %s - %s, %s, %s, %d escalas, %d millas, %f de Tasas e impuestos\n",
-			cheapestFlight.Departure.Date.Format(dateLayout),
-			cheapestFlight.Departure.Airport.Code,
-			cheapestFlight.Arrival.Airport.Code,
-			cheapestFlight.Cabin,
-			cheapestFlight.Airline.Name,
-			cheapestFlight.Stops,
-			cheapestFare.Miles,
-			boardingTax.Totals.Total.Money,
-		)
-
+		sb.WriteString("<b>●</b> " + cheapestFlight.Departure.Date.Format(dateLayout) + ": " + cheapestFlight.Departure.Airport.Code + " - " + cheapestFlight.Arrival.Airport.Code + ", " + cheapestFlight.Cabin + ", " + cheapestFlight.Airline.Name + ", " + strconv.Itoa(cheapestFlight.Stops) + " escalas, " + strconv.Itoa(cheapestFare.Miles) + " millas, " + strconv.FormatFloat(float64(boardingTax.Totals.Total.Money), 'f', 6, 64) + " de Tasas e impuestos \n")
 	}
-	fmt.Println()
+
+	return sb.String()
 }
 
 func getTaxForFlight(c *http.Client, flight *model.Flight, fare *model.Fare) *model.BoardingTax {
